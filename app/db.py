@@ -25,7 +25,8 @@ def horizon() -> int:
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS days (
-    day TEXT PRIMARY KEY
+    day     TEXT PRIMARY KEY,
+    version INTEGER NOT NULL DEFAULT 1   -- 计划版号：初次导入为 1，每次换版 +1
 );
 CREATE TABLE IF NOT EXISTS trips (
     day      TEXT NOT NULL REFERENCES days(day) ON DELETE CASCADE,
@@ -64,8 +65,19 @@ def init_db() -> None:
     conn = connect()
     try:
         conn.executescript(SCHEMA)
+        _migrate(conn)
     finally:
         conn.close()
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """兼容旧库：建库早于版号功能时补上 days.version，已有计划即初始版号 1。"""
+    columns = {r["name"] for r in conn.execute("PRAGMA table_info(days)")}
+    if "version" not in columns:
+        with write_txn(conn):
+            conn.execute(
+                "ALTER TABLE days ADD COLUMN version INTEGER NOT NULL DEFAULT 1"
+            )
 
 
 @contextmanager
@@ -74,21 +86,26 @@ def read_txn(conn: sqlite3.Connection):
     conn.execute("BEGIN")
     try:
         yield conn
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
-    else:
         conn.execute("COMMIT")
+    except BaseException:
+        _rollback_quietly(conn)
+        raise
 
 
 @contextmanager
 def write_txn(conn: sqlite3.Connection):
-    """写事务：立即取写锁；任何异常整体回滚，保留原数据。"""
+    """写事务：立即取写锁；任何异常（含提交失败）整体回滚，保留原数据。"""
     conn.execute("BEGIN IMMEDIATE")
     try:
         yield conn
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
-    else:
         conn.execute("COMMIT")
+    except BaseException:
+        _rollback_quietly(conn)
+        raise
+
+
+def _rollback_quietly(conn: sqlite3.Connection) -> None:
+    try:
+        conn.execute("ROLLBACK")
+    except sqlite3.Error:
+        pass

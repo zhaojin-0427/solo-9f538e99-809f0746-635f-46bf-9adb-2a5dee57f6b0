@@ -327,9 +327,20 @@ def test_day_overview_endpoints(client):
     import_plan(client)
     post_actuals(client, [{"trip_id": "A", "actual": 150}])
     r = client.get("/days")
-    assert r.json()["days"] == [{"day": DAY, "trips": 4, "with_actual": 1}]
+    assert r.json()["days"] == [
+        {"day": DAY, "version": 1, "trips": 4, "with_actual": 1}
+    ]
     r = client.get(f"/days/{DAY}")
-    assert r.json() == {"day": DAY, "trips": 4, "with_actual": 1, "connections": 3}
+    assert r.json() == {
+        "day": DAY,
+        "version": 1,
+        "trips": 4,
+        "with_actual": 1,
+        "connections": 3,
+    }
+    assert client.get("/days").json()["days"] == [
+        {"day": DAY, "version": 1, "trips": 4, "with_actual": 1}
+    ]
     assert client.get("/days/2099-01-01").status_code == 404
     assert client.get(f"/days/{DAY}/trips/ZZ").status_code == 404
 
@@ -396,3 +407,528 @@ def test_scale_50k(client):
     wait = get_trip(client, "C2499T10").json()["wait"]
     # EF(C2499T9)=109 → min=10；LF=150-1=149 → max=149+1-100=50
     assert wait == {"known_wait": 0, "min_wait": 10, "max_wait": 50}
+
+
+# ---------------------------------------------------------------- 计划换版
+
+def replan_plan(mapping, trips=None, connections=None):
+    return {
+        "version": 1,
+        "trips": trips
+        or [
+            {"trip_id": "A", "planned": 100},
+            {"trip_id": "B", "planned": 200},
+            {"trip_id": "C", "planned": 140},
+            {"trip_id": "D", "planned": 300},
+        ],
+        "connections": connections
+        if connections is not None
+        else [
+            {"pred": "A", "succ": "B", "min_interval": 30},
+            {"pred": "A", "succ": "C", "min_interval": 10},
+            {"pred": "B", "succ": "D", "min_interval": 20},
+        ],
+        "mapping": mapping,
+    }
+
+
+def post_replan(client, body, day=DAY):
+    return client.post(f"/days/{day}/plan/replan", json=body)
+
+
+def test_replan_renames_and_migrates_actuals(client):
+    import_plan(client)
+    post_actuals(client, [{"trip_id": "A", "actual": 200}])
+
+    r = post_replan(
+        client,
+        replan_plan(
+            [{"new_trip_id": "A2", "old_trip_id": "A"}],
+            trips=[
+                {"trip_id": "A2", "planned": 100},
+                {"trip_id": "B", "planned": 200},
+                {"trip_id": "C", "planned": 140},
+                {"trip_id": "D", "planned": 300},
+            ],
+            connections=[
+                {"pred": "A2", "succ": "B", "min_interval": 30},
+                {"pred": "A2", "succ": "C", "min_interval": 10},
+                {"pred": "B", "succ": "D", "min_interval": 20},
+            ],
+        ),
+    )
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["version"] == 2
+    assert body["previous_version"] == 1
+    assert body["migrated"] == 1
+
+    # 旧班号已不在新版计划中；实发随对照迁到新班号
+    assert get_trip(client, "A").status_code == 404
+    migrated = get_trip(client, "A2").json()
+    assert migrated["version"] == 2
+    assert migrated["actual"] == 200
+    assert migrated["wait"] == {"known_wait": 0, "min_wait": 0, "max_wait": 0}
+    # 改版后的接续表生效：B 的前序是 A2
+    assert get_trip(client, "B").json()["planned"] == 200
+
+
+def test_replan_swaps_trip_numbers(client):
+    """允许两班互换编号：实发按对照跟随班次内容。"""
+    import_plan(client)
+    post_actuals(client, [{"trip_id": "B", "actual": 240}])
+
+    # B 与 C 互换编号：新 B 实际上是旧 C，新 C 是旧 B；接续随之调整。
+    r = post_replan(
+        client,
+        replan_plan(
+            [
+                {"new_trip_id": "B", "old_trip_id": "C"},
+                {"new_trip_id": "C", "old_trip_id": "B"},
+            ],
+            connections=[
+                {"pred": "A", "succ": "C", "min_interval": 30},
+                {"pred": "A", "succ": "B", "min_interval": 10},
+                {"pred": "C", "succ": "D", "min_interval": 20},
+            ],
+        ),
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["migrated"] == 1
+    assert get_trip(client, "B").json()["actual"] is None
+    assert get_trip(client, "C").json()["actual"] == 240
+    assert get_trip(client, "C").json()["version"] == 2
+
+
+def test_replan_rejects_stale_version(client):
+    import_plan(client)
+    post_actuals(client, [{"trip_id": "A", "actual": 130}])
+    body = replan_plan([{"new_trip_id": "A", "old_trip_id": "A"}])
+    body["version"] = 2
+    r = post_replan(client, body)
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["current_version"] == 1
+    assert get_trip(client, "A").json()["version"] == 1
+    assert get_trip(client, "A").json()["actual"] == 130
+
+
+def test_replan_rejects_unmapped_actual(client):
+    import_plan(client)
+    post_actuals(client, [{"trip_id": "A", "actual": 130}])
+    post_actuals(client, [{"trip_id": "B", "actual": 240}])
+    r = post_replan(
+        client, replan_plan([{"new_trip_id": "A", "old_trip_id": "A"}])
+    )
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert detail["missing_old_trip_ids"] == ["B"]
+    # 计划与实发原样保留
+    assert get_trip(client, "A").json()["actual"] == 130
+    assert get_trip(client, "B").json()["actual"] == 240
+    assert get_trip(client, "A").json()["version"] == 1
+
+
+def test_replan_rejects_mapping_errors(client):
+    import_plan(client)
+    # 新班号不在新版计划中
+    r = post_replan(
+        client, replan_plan([{"new_trip_id": "ZZ", "old_trip_id": "A"}])
+    )
+    assert r.status_code == 400, r.text
+    # 对照中新班号重复
+    r = post_replan(
+        client,
+        replan_plan(
+            [
+                {"new_trip_id": "A", "old_trip_id": "B"},
+                {"new_trip_id": "A", "old_trip_id": "C"},
+            ]
+        ),
+    )
+    assert r.status_code == 400, r.text
+    # 对照中旧班号重复
+    r = post_replan(
+        client,
+        replan_plan(
+            [
+                {"new_trip_id": "B", "old_trip_id": "A"},
+                {"new_trip_id": "C", "old_trip_id": "A"},
+            ]
+        ),
+    )
+    assert r.status_code == 400, r.text
+    # 新计划本身非法（计划早于 0）
+    bad = replan_plan([], trips=[{"trip_id": "A", "planned": -1}], connections=[])
+    assert post_replan(client, bad).status_code in (400, 422)
+    assert get_trip(client, "A").json()["version"] == 1
+
+
+def test_replan_rejects_infeasible_new_plan_and_keeps_data(client):
+    import_plan(client)
+    post_actuals(client, [{"trip_id": "A", "actual": 400}])
+    # 迁入 A=400，但新版接续 A->B->D 要求 D >= 450，与新计划 D=300 无实发冲突可解
+    # 另加一条 A=400 -> 后续要求超过运营日，使新计划不可行。
+    r = post_replan(
+        client,
+        replan_plan(
+            [{"new_trip_id": "A", "old_trip_id": "A"}],
+            connections=[
+                {"pred": "A", "succ": "B", "min_interval": 2500},
+                {"pred": "B", "succ": "D", "min_interval": 20},
+            ],
+        ),
+    )
+    assert r.status_code == 409, r.text
+    assert "校验" in r.text or "不可行" in r.text
+    assert get_trip(client, "A").json()["actual"] == 400
+    assert get_trip(client, "A").json()["version"] == 1
+
+
+def test_replan_rejects_migrated_actual_earlier_than_new_plan(client):
+    import_plan(client)
+    post_actuals(client, [{"trip_id": "A", "actual": 120}])
+    # 新版把 A 的计划推迟到 150，迁入实发 120 早于新计划 → 拒绝
+    r = post_replan(
+        client,
+        replan_plan(
+            [{"new_trip_id": "A", "old_trip_id": "A"}],
+            trips=[
+                {"trip_id": "A", "planned": 150},
+                {"trip_id": "B", "planned": 200},
+                {"trip_id": "C", "planned": 140},
+                {"trip_id": "D", "planned": 300},
+            ],
+            connections=[
+                {"pred": "A", "succ": "B", "min_interval": 30},
+                {"pred": "A", "succ": "C", "min_interval": 10},
+                {"pred": "B", "succ": "D", "min_interval": 20},
+            ],
+        ),
+    )
+    assert r.status_code == 409, r.text
+    assert get_trip(client, "A").json()["actual"] == 120
+    assert get_trip(client, "A").json()["version"] == 1
+
+
+def test_actuals_require_current_version_after_replan(client):
+    import_plan(client)
+    post_actuals(client, [{"trip_id": "A", "actual": 130}])
+    assert post_replan(
+        client, replan_plan([{"new_trip_id": "A", "old_trip_id": "A"}])
+    ).status_code == 201
+
+    # 缺版号 → 拒绝
+    r = post_actuals(client, [{"trip_id": "B", "actual": 240}])
+    assert r.status_code == 409, r.text
+    assert "版号" in r.text
+    # 旧版号 → 拒绝
+    r = client.post(
+        f"/days/{DAY}/actuals",
+        json={"version": 1, "updates": [{"trip_id": "B", "actual": 240}]},
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["current_version"] == 2
+    assert get_trip(client, "B").json()["actual"] is None
+    # 当前版号 → 通过
+    r = client.post(
+        f"/days/{DAY}/actuals",
+        json={"version": 2, "updates": [{"trip_id": "B", "actual": 240}]},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["version"] == 2
+    assert get_trip(client, "B").json()["actual"] == 240
+
+
+def test_actuals_before_first_replan_keep_legacy_format(client):
+    """旧库/首次换版前：不带 version 的批次仍可提交。"""
+    import_plan(client)
+    assert post_actuals(client, [{"trip_id": "A", "actual": 130}]).status_code == 200
+    assert post_actuals(client, [{"trip_id": "B", "actual": 240}]).status_code == 200
+
+
+def test_replan_migrates_latest_actual_submitted_during_verification(client, monkeypatch):
+    """换版验算期间提交的补录/更正/撤销，切换时按最新已提交实发迁移。"""
+    import_plan(client)
+    post_actuals(client, [{"trip_id": "A", "actual": 130}])
+
+    from app import logic
+
+    original = logic.feasibility
+    interleaved = {"done": False}
+
+    def feasibility_with_interleaved_write(trips, preds, succs, horizon_minutes):
+        if not interleaved["done"]:
+            interleaved["done"] = True
+            # 换版验算在写锁之外，此刻另一请求提交实发更正，应当成功。
+            r = client.post(
+                f"/days/{DAY}/actuals",
+                json={"version": 1, "updates": [{"trip_id": "A", "actual": 160}]},
+            )
+            assert r.status_code == 200, r.text
+        return original(trips, preds, succs, horizon_minutes)
+
+    monkeypatch.setattr(logic, "feasibility", feasibility_with_interleaved_write)
+    r = post_replan(client, replan_plan([{"new_trip_id": "A", "old_trip_id": "A"}]))
+    assert r.status_code == 201, r.text
+    assert interleaved["done"] is True
+    # 切换按验算期间最新提交的 A=160 迁移，而非验算开始时的快照 130。
+    assert get_trip(client, "A").json()["actual"] == 160
+    assert get_trip(client, "A").json()["version"] == 2
+
+
+def test_interleaved_new_actual_and_revoke_during_verification(client, monkeypatch):
+    """验算期间同时补录新班次、撤销另一班次，切换迁移包含这些最新更改。"""
+    import_plan(client)
+    post_actuals(client, [{"trip_id": "A", "actual": 200}])
+    post_actuals(client, [{"trip_id": "B", "actual": 240}])
+
+    from app import logic
+
+    original = logic.feasibility
+    interleaved = {"done": False}
+
+    def feasibility_with_interleaved_batch(trips, preds, succs, horizon_minutes):
+        if not interleaved["done"]:
+            interleaved["done"] = True
+            r = client.post(
+                f"/days/{DAY}/actuals",
+                json={
+                    "version": 1,
+                    "updates": [
+                        {"trip_id": "C", "actual": 400},  # 补录
+                        {"trip_id": "B", "actual": None},  # 撤销
+                    ],
+                },
+            )
+            assert r.status_code == 200, r.text
+        return original(trips, preds, succs, horizon_minutes)
+
+    monkeypatch.setattr(logic, "feasibility", feasibility_with_interleaved_batch)
+    r = post_replan(
+        client,
+        replan_plan(
+            [
+                {"new_trip_id": "A2", "old_trip_id": "A"},
+                {"new_trip_id": "B", "old_trip_id": "B"},
+                {"new_trip_id": "C", "old_trip_id": "C"},
+            ],
+            trips=[
+                {"trip_id": "A2", "planned": 100},
+                {"trip_id": "B", "planned": 200},
+                {"trip_id": "C", "planned": 140},
+                {"trip_id": "D", "planned": 300},
+            ],
+            connections=[
+                {"pred": "A2", "succ": "B", "min_interval": 30},
+                {"pred": "A2", "succ": "C", "min_interval": 10},
+                {"pred": "B", "succ": "D", "min_interval": 20},
+            ],
+        ),
+    )
+    assert r.status_code == 201, r.text
+    assert get_trip(client, "A2").json()["actual"] == 200
+    assert get_trip(client, "B").json()["actual"] is None
+    assert get_trip(client, "C").json()["actual"] == 400
+    assert get_trip(client, "C").json()["version"] == 2
+
+
+def test_replan_rejects_interleaved_conflict_and_keeps_latest_actuals(
+    client, monkeypatch
+):
+    """验算期间提交的实发若使迁入后不可行，换版拒绝且保留最新实发。"""
+    import_plan(client)
+    from app import logic
+
+    original = logic.feasibility
+    interleaved = {"done": False}
+
+    def feasibility_then_conflicting_write(trips, preds, succs, horizon_minutes):
+        if not interleaved["done"]:
+            interleaved["done"] = True
+            # 新计划把 A 的计划改为 100（不变），B 改为 450；
+            # 期间提交 B=240 仍与新计划自洽，但随后把 A 更正为 500 会让 B 需要 >=530。
+            r = client.post(
+                f"/days/{DAY}/actuals",
+                json={"version": 1, "updates": [{"trip_id": "A", "actual": 500}]},
+            )
+            assert r.status_code == 200, r.text
+        return original(trips, preds, succs, horizon_minutes)
+
+    monkeypatch.setattr(logic, "feasibility", feasibility_then_conflicting_write)
+    # 新版把 A 计划提到 510，迁入实发 A=500 早于新计划且接续不可行 → 拒绝
+    r = post_replan(
+        client,
+        replan_plan(
+            [{"new_trip_id": "A", "old_trip_id": "A"}],
+            trips=[
+                {"trip_id": "A", "planned": 510},
+                {"trip_id": "B", "planned": 200},
+                {"trip_id": "C", "planned": 140},
+                {"trip_id": "D", "planned": 300},
+            ],
+            connections=[
+                {"pred": "A", "succ": "B", "min_interval": 30},
+                {"pred": "A", "succ": "C", "min_interval": 10},
+                {"pred": "B", "succ": "D", "min_interval": 20},
+            ],
+        ),
+    )
+    assert r.status_code == 409, r.text
+    # 换版未生效，验算期间提交的 A=500 保留
+    body = get_trip(client, "A").json()
+    assert body["version"] == 1
+    assert body["actual"] == 500
+
+
+def test_replan_reused_trip_number_does_not_inherit_old_actual(client):
+    """新计划重用旧班号时，实发只按对照走，不因同号自动继承。"""
+    import_plan(client)
+    post_actuals(client, [{"trip_id": "A", "actual": 200}])
+    # 新 A 是另一班；旧 A 的实发迁到 A2。
+    r = post_replan(
+        client,
+        replan_plan(
+            [{"new_trip_id": "A2", "old_trip_id": "A"}],
+            trips=[
+                {"trip_id": "A", "planned": 600},
+                {"trip_id": "A2", "planned": 100},
+                {"trip_id": "B", "planned": 200},
+                {"trip_id": "C", "planned": 140},
+                {"trip_id": "D", "planned": 300},
+            ],
+            connections=[
+                {"pred": "A2", "succ": "B", "min_interval": 30},
+                {"pred": "A2", "succ": "C", "min_interval": 10},
+                {"pred": "B", "succ": "D", "min_interval": 20},
+            ],
+        ),
+    )
+    assert r.status_code == 201, r.text
+    assert get_trip(client, "A").json()["actual"] is None
+    assert get_trip(client, "A2").json()["actual"] == 200
+
+
+def test_replan_unknown_day(client):
+    r = post_replan(client, replan_plan([]))
+    assert r.status_code == 404, r.text
+
+
+def test_replan_rejects_unknown_old_trip(client):
+    import_plan(client)
+    r = post_replan(
+        client, replan_plan([{"new_trip_id": "A", "old_trip_id": "NOPE"}])
+    )
+    assert r.status_code == 400, r.text
+    assert "旧计划" in r.text
+
+
+def test_replan_without_actuals_and_repeated_versions(client):
+    import_plan(client)
+    assert post_replan(client, replan_plan([])).status_code == 201
+    body = get_trip(client, "A").json()
+    assert body["version"] == 2
+    # 第二次换版须带版号 2
+    stale = replan_plan([])
+    r = post_replan(client, stale)
+    assert r.status_code == 409
+    assert r.json()["detail"]["current_version"] == 2
+    stale["version"] = 2
+    r = post_replan(client, stale)
+    assert r.status_code == 201, r.text
+    assert r.json()["version"] == 3
+    assert get_trip(client, "A").json()["version"] == 3
+
+
+def test_replan_persists_across_restart(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "replan.db"))
+    with TestClient(app) as c1:
+        import_plan(c1)
+        post_actuals(c1, [{"trip_id": "A", "actual": 200}])
+        r = post_replan(
+            c1,
+            replan_plan(
+                [{"new_trip_id": "A2", "old_trip_id": "A"}],
+                trips=[
+                    {"trip_id": "A2", "planned": 100},
+                    {"trip_id": "B", "planned": 200},
+                    {"trip_id": "C", "planned": 140},
+                    {"trip_id": "D", "planned": 300},
+                ],
+                connections=[
+                    {"pred": "A2", "succ": "B", "min_interval": 30},
+                    {"pred": "A2", "succ": "C", "min_interval": 10},
+                    {"pred": "B", "succ": "D", "min_interval": 20},
+                ],
+            ),
+        )
+        assert r.status_code == 201, r.text
+
+    with TestClient(app) as c2:
+        body = c2.get(f"/days/{DAY}/trips/A2").json()
+        assert body["version"] == 2
+        assert body["actual"] == 200
+        assert c2.get(f"/days/{DAY}").json()["version"] == 2
+        # 重启后旧版号仍被拒绝
+        r = c2.post(
+            f"/days/{DAY}/actuals",
+            json={"version": 1, "updates": [{"trip_id": "B", "actual": 240}]},
+        )
+        assert r.status_code == 409
+
+
+def test_old_database_migrates_to_initial_version(tmp_path, monkeypatch):
+    """旧库（days 无 version 列）升级后，计划直接可查初始版号，且沿用原批录格式。"""
+    import sqlite3
+
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE days (day TEXT PRIMARY KEY);
+        CREATE TABLE trips (
+            day TEXT NOT NULL REFERENCES days(day) ON DELETE CASCADE,
+            trip_id TEXT NOT NULL,
+            planned INTEGER NOT NULL,
+            topo INTEGER NOT NULL,
+            actual INTEGER,
+            PRIMARY KEY (day, trip_id)
+        );
+        CREATE TABLE connections (
+            day TEXT NOT NULL REFERENCES days(day) ON DELETE CASCADE,
+            pred TEXT NOT NULL,
+            succ TEXT NOT NULL,
+            min_interval INTEGER NOT NULL,
+            PRIMARY KEY (day, pred, succ)
+        );
+        """
+    )
+    conn.execute("INSERT INTO days(day) VALUES (?)", (DAY,))
+    conn.executemany(
+        "INSERT INTO trips(day, trip_id, planned, topo, actual) VALUES (?,?,?,?,?)",
+        [(DAY, "A", 100, 0, 130), (DAY, "B", 200, 1, None)],
+    )
+    conn.execute(
+        "INSERT INTO connections(day, pred, succ, min_interval) VALUES (?,?,?,?)",
+        (DAY, "A", "B", 30),
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setenv("DB_PATH", str(path))
+    with TestClient(app) as c:
+        body = c.get(f"/days/{DAY}/trips/A").json()
+        assert body["version"] == 1
+        assert body["actual"] == 130
+        # 首次换版前沿用原批录格式（不带 version）
+        r = c.post(
+            f"/days/{DAY}/actuals",
+            json={"updates": [{"trip_id": "B", "actual": 240}]},
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["version"] == 1

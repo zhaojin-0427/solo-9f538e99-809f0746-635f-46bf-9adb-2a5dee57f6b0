@@ -1,8 +1,9 @@
 """公交接续等待复盘服务。
 
 - POST /days/{day}/plan     按运营日一次导入计划表（班次 + 接续，可在 /docs 操作）
+- POST /days/{day}/plan/replan  重发全量计划（带当前版号 + 新旧班号对照），迁移实发
 - POST /days/{day}/actuals  成批补录 / 更正 / 撤销实发（actual 为 null 即撤销）
-- GET  /days/{day}/trips/{trip_id}  查询单班：实发 + 接续等待区间
+- GET  /days/{day}/trips/{trip_id}  查询单班：计划版号 + 实发 + 接续等待区间
 - GET  /days/{day}/actuals  列出当日全部实发（含已知等待）
 - GET  /days / GET /days/{day}      运营日概览
 - DELETE /days/{day}                删除运营日（用于重导计划）
@@ -21,9 +22,12 @@ from .logic import (
     BatchConflict,
     BatchError,
     DayGraph,
+    DayNotFound,
     PlanError,
+    VersionConflict,
     apply_actuals,
     import_plan,
+    replan,
     wait_interval,
 )
 
@@ -80,17 +84,59 @@ class ActualBatchIn(BaseModel):
         json_schema_extra={
             "examples": [
                 {
+                    "version": 2,
                     "updates": [
                         {"trip_id": "A101", "actual": 487},
                         {"trip_id": "B201", "actual": 509},
                         {"trip_id": "A102", "actual": None},
-                    ]
+                    ],
                 }
             ]
         }
     )
 
+    version: int | None = Field(
+        default=None,
+        description="计划版号。换版后（版号 >= 2）必填且须为当前版号；"
+        "旧版或缺失一律拒绝。首次换版前可省略。",
+    )
     updates: list[ActualUpdate] = Field(description="成批补录/更正/撤销")
+
+
+class TripMappingIn(BaseModel):
+    new_trip_id: str = Field(min_length=1, max_length=64, description="新版班次号")
+    old_trip_id: str = Field(min_length=1, max_length=64, description="旧版对应班次号")
+
+
+class ReplanIn(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "version": 1,
+                    "trips": [
+                        {"trip_id": "A101", "planned": 480},
+                        {"trip_id": "B202", "planned": 500},
+                    ],
+                    "connections": [
+                        {"pred": "A101", "succ": "B202", "min_interval": 15}
+                    ],
+                    "mapping": [{"new_trip_id": "B202", "old_trip_id": "B201"}],
+                }
+            ]
+        }
+    )
+
+    version: int = Field(ge=1, description="提交时看到的计划版号（须为当前版号）")
+    trips: list[TripIn] = Field(min_length=1, description="新版各班计划发车分钟")
+    connections: list[ConnectionIn] = Field(
+        default_factory=list, description="新版接续表"
+    )
+    mapping: list[TripMappingIn] = Field(
+        default_factory=list,
+        description="新旧班号一对一对照（new -> old）。须覆盖当日所有已有实发的旧班次；"
+        "允许两班互换编号。",
+    )
 
 
 class WaitOut(BaseModel):
@@ -99,8 +145,17 @@ class WaitOut(BaseModel):
     max_wait: int = Field(description="所有合法补全中能达到的最大接续等待")
 
 
+class DayOut(BaseModel):
+    day: str
+    version: int = Field(description="当前计划版号")
+    trips: int
+    with_actual: int
+    connections: int
+
+
 class TripOut(BaseModel):
     day: str
+    version: int = Field(description="本次查询所见计划版号（与实发、等待区间同一次提交）")
     trip_id: str
     planned: int
     actual: int | None
@@ -117,10 +172,11 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="公交接续等待复盘",
-    version="1.0.0",
+    version="2.0.0",
     description=(
-        "按运营日导入计划表，成批补录/更正/撤销实发，"
-        "查询各班实发与接续等待区间（最少拖了多久、最多能解释几分钟）。"
+        "按运营日导入计划表，重发换版时按新旧班号对照迁移实发，"
+        "成批补录/更正/撤销实发，查询各班实发与接续等待区间"
+        "（最少拖了多久、最多能解释几分钟）。"
     ),
     lifespan=lifespan,
 )
@@ -138,7 +194,9 @@ def get_conn():
 def sqlite_busy_handler(_request, exc):
     return JSONResponse(
         status_code=503,
-        content={"detail": f"数据库暂时不可用，请重试：{exc}"},
+        content={
+            "detail": f"写入失败，已提交的计划与实发保持不变，请重试：{exc}"
+        },
     )
 
 
@@ -171,6 +229,47 @@ def post_plan(
     return {"day": day, **result}
 
 
+@app.post(
+    "/days/{day}/plan/replan",
+    status_code=201,
+    tags=["计划"],
+    responses={
+        409: {"description": "版号过期 / 实发无去向 / 新计划与迁入实发校验不通过，均未写入"}
+    },
+)
+def post_replan(
+    body: ReplanIn,
+    day: str = Path(pattern=DAY_PATTERN, description="运营日 YYYY-MM-DD"),
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    """重发运营日全量计划：带当前版号、新版班次与接续表、新旧班号一对一对照。
+
+    已提交实发只按对照迁移（允许两班互换编号）；以提交时最新已提交的实发为准。
+    换版验算与新计划校验沿用原规则，失败整体回滚，已提交的计划与实发原样保留。
+    """
+    try:
+        result = replan(
+            conn,
+            day,
+            body.version,
+            body.trips,
+            body.connections,
+            body.mapping,
+            horizon(),
+        )
+    except DayNotFound:
+        raise HTTPException(status_code=404, detail="运营日不存在，请先导入计划")
+    except PlanError as exc:
+        raise HTTPException(
+            status_code=exc.status, detail={"message": exc.message, **exc.details}
+        )
+    except VersionConflict as exc:
+        raise HTTPException(
+            status_code=409, detail={"message": exc.message, **exc.details}
+        )
+    return {"day": day, **result}
+
+
 @app.delete("/days/{day}", tags=["计划"])
 def delete_day(
     day: str = Path(pattern=DAY_PATTERN),
@@ -198,10 +297,18 @@ def post_actuals(
     if not _day_exists(conn, day):
         raise HTTPException(status_code=404, detail="运营日不存在，请先导入计划")
     try:
-        applied = apply_actuals(conn, day, body.updates, horizon())
+        applied, version = apply_actuals(
+            conn, day, body.updates, horizon(), expected_version=body.version
+        )
     except BatchError as exc:
         raise HTTPException(
             status_code=400, detail={"message": exc.message, **exc.details}
+        )
+    except DayNotFound:
+        raise HTTPException(status_code=404, detail="运营日不存在，请先导入计划")
+    except VersionConflict as exc:
+        raise HTTPException(
+            status_code=409, detail={"message": exc.message, **exc.details}
         )
     except BatchConflict as exc:
         raise HTTPException(
@@ -212,7 +319,7 @@ def post_actuals(
                 "conflicts": exc.conflicts,
             },
         )
-    return {"day": day, "applied": applied}
+    return {"day": day, "version": version, "applied": applied}
 
 
 @app.get("/days/{day}/trips/{trip_id}", response_model=TripOut, tags=["查询"])
@@ -221,12 +328,13 @@ def get_trip(
     trip_id: str = Path(description="班次号"),
     conn: sqlite3.Connection = Depends(get_conn),
 ):
-    """查询单班：有实发时同时给出实发与接续等待区间（同一事务快照）。"""
+    """查询单班：有实发时同时给出实发与接续等待区间（同一事务快照，含计划版号）。"""
     with read_txn(conn):
         graph = DayGraph(conn, day)
         row = graph.trip(trip_id)
         if row is None:
             raise HTTPException(status_code=404, detail="班次或运营日不存在")
+        version = graph.version()
         wait = (
             wait_interval(graph, trip_id, horizon())
             if row["actual"] is not None
@@ -234,6 +342,7 @@ def get_trip(
         )
     return TripOut(
         day=day,
+        version=version,
         trip_id=trip_id,
         planned=row["planned"],
         actual=row["actual"],
@@ -252,6 +361,9 @@ def list_actuals(
     with read_txn(conn):
         if not _day_exists(conn, day):
             raise HTTPException(status_code=404, detail="运营日不存在")
+        version = conn.execute(
+            "SELECT version FROM days WHERE day = ?", (day,)
+        ).fetchone()["version"]
         rows = conn.execute(
             """
             SELECT t.trip_id  AS trip_id,
@@ -278,7 +390,7 @@ def list_actuals(
         }
         for r in rows
     ]
-    return {"day": day, "count": len(items), "items": items}
+    return {"day": day, "version": version, "count": len(items), "items": items}
 
 
 @app.get("/days", tags=["查询"])
@@ -287,9 +399,10 @@ def list_days(conn: sqlite3.Connection = Depends(get_conn)):
     with read_txn(conn):
         rows = conn.execute(
             """
-            SELECT d.day           AS day,
-                   COUNT(t.trip_id) AS trips,
-                   COUNT(t.actual)  AS with_actual
+            SELECT d.day            AS day,
+                   d.version        AS version,
+                   COUNT(t.trip_id)  AS trips,
+                   COUNT(t.actual)   AS with_actual
             FROM days d
             LEFT JOIN trips t ON t.day = d.day
             GROUP BY d.day
@@ -299,7 +412,7 @@ def list_days(conn: sqlite3.Connection = Depends(get_conn)):
     return {"days": [dict(r) for r in rows]}
 
 
-@app.get("/days/{day}", tags=["查询"])
+@app.get("/days/{day}", response_model=DayOut, tags=["查询"])
 def day_info(
     day: str = Path(pattern=DAY_PATTERN),
     conn: sqlite3.Connection = Depends(get_conn),
@@ -309,6 +422,7 @@ def day_info(
         row = conn.execute(
             """
             SELECT d.day            AS day,
+                   d.version        AS version,
                    COUNT(t.trip_id)  AS trips,
                    COUNT(t.actual)   AS with_actual,
                    (SELECT COUNT(*) FROM connections c WHERE c.day = d.day) AS connections

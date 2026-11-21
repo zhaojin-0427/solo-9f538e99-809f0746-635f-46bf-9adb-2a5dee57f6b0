@@ -12,31 +12,51 @@
   等待对每个前序实发单调不减，且"全部取最早"/"全部取最晚"各自都是合法补全，
   因此区间端点分别由 EF、LF 给出。
 - 单班查询只走该班前序的祖先/子孙子图（DayGraph 按需取数），不遍历全日接续。
-- 可行性校验（每次计划导入与实发批次后，在写事务内执行）：
+- 可行性校验（每次计划导入、计划换版与实发批次后执行）：
   全日按拓扑序传播 EF、逆拓扑序传播 LF：
     1) 有实发班次：实发 < 所需最早时刻  → 矛盾（冲突时刻 + 接续链）；
     2) 无实发班次：EF > LF（已知实发把它逼到运营日之外）→ 矛盾。
   校验不过整体回滚，保证库中数据始终存在至少一个合法补全，
   因此等待区间恒有 min_wait <= max_wait。
+- 计划版号：days.version 初次导入为 1，每次换版 +1。换版（replan）重发当日全量
+  计划，并只按新旧班号一对一对照迁移已提交实发；验算在写锁外用读快照进行
+  （期间补录/更正/撤销仍可提交），切换在写锁内按核对到的最新实发重验后完成。
 """
 from __future__ import annotations
 
 from collections import deque
 
-from .db import write_txn
+from .db import read_txn, write_txn
 
 MAX_PREDECESSORS = 4
 MAX_CONFLICTS_REPORTED = 100
 
 
 class PlanError(Exception):
-    """计划导入校验失败（不写入任何数据）。"""
+    """计划导入/换版校验失败（不写入任何数据）。"""
 
     def __init__(self, message: str, details: dict | None = None, status: int = 400):
         super().__init__(message)
         self.message = message
         self.details = details or {}
         self.status = status
+
+
+class DayNotFound(Exception):
+    """运营日不存在。"""
+
+    def __init__(self, day: str):
+        super().__init__(day)
+        self.day = day
+
+
+class VersionConflict(Exception):
+    """计划版号与库中当前版号不一致（未写入任何数据）。"""
+
+    def __init__(self, message: str, details: dict | None = None):
+        super().__init__(message)
+        self.message = message
+        self.details = details or {}
 
 
 class BatchError(Exception):
@@ -81,16 +101,17 @@ def topo_order(trip_ids, edges) -> dict:
     return order
 
 
-def import_plan(conn, day: str, trips, connections, horizon_minutes: int) -> dict:
-    if conn.execute("SELECT 1 FROM days WHERE day = ?", (day,)).fetchone():
-        raise PlanError("该运营日已有计划，需先删除再导入", {"day": day}, status=409)
+def _validate_plan(trips, connections, horizon_minutes) -> tuple[list, dict]:
+    """校验一份完整计划表（班次 + 接续），返回 (边列表, 拓扑序)。
 
+    换版（replan）与首次导入共用同一套规则：≤4 前序、无环、分钟不越界。
+    """
     ids: set[str] = set()
     for t in trips:
         if t.trip_id in ids:
             raise PlanError("计划内 trip_id 重复", {"trip_id": t.trip_id})
         ids.add(t.trip_id)
-        if t.planned >= horizon_minutes:
+        if not 0 <= t.planned < horizon_minutes:
             raise PlanError(
                 "计划发车分钟超出运营日范围",
                 {"trip_id": t.trip_id, "planned": t.planned, "horizon": horizon_minutes},
@@ -104,7 +125,7 @@ def import_plan(conn, day: str, trips, connections, horizon_minutes: int) -> dic
             raise PlanError("不允许班次接续自身", {"trip_id": c.pred})
         if c.pred not in ids or c.succ not in ids:
             raise PlanError("接续引用了不存在的班次", {"pred": c.pred, "succ": c.succ})
-        if c.min_interval >= horizon_minutes:
+        if not 0 <= c.min_interval < horizon_minutes:
             raise PlanError(
                 "最短接续间隔超出运营日范围",
                 {"pred": c.pred, "succ": c.succ, "min_interval": c.min_interval},
@@ -120,10 +141,17 @@ def import_plan(conn, day: str, trips, connections, horizon_minutes: int) -> dic
             )
         edges.append((c.pred, c.succ, c.min_interval))
 
-    order = topo_order(ids, edges)
+    return edges, topo_order(ids, edges)
+
+
+def import_plan(conn, day: str, trips, connections, horizon_minutes: int) -> dict:
+    if conn.execute("SELECT 1 FROM days WHERE day = ?", (day,)).fetchone():
+        raise PlanError("该运营日已有计划，需删除再导入", {"day": day}, status=409)
+
+    edges, order = _validate_plan(trips, connections, horizon_minutes)
 
     with write_txn(conn):
-        conn.execute("INSERT INTO days(day) VALUES (?)", (day,))
+        conn.execute("INSERT INTO days(day, version) VALUES (?, 1)", (day,))
         conn.executemany(
             "INSERT INTO trips(day, trip_id, planned, topo) VALUES (?,?,?,?)",
             [(day, t.trip_id, t.planned, order[t.trip_id]) for t in trips],
@@ -139,14 +167,17 @@ def import_plan(conn, day: str, trips, connections, horizon_minutes: int) -> dic
                 "计划在运营日时长内不可行（接续链超出可排范围）",
                 {"total_conflicts": total, "conflicts": conflicts},
             )
-    return {"trips": len(trips), "connections": len(edges)}
+    return {"version": 1, "trips": len(trips), "connections": len(edges)}
 
 
 # ---------------------------------------------------------------- 实发批次
 
-def apply_actuals(conn, day: str, updates, horizon_minutes: int) -> int:
-    """补录/更正/撤销一批实发（actual 为 None 即撤销）。
+def apply_actuals(
+    conn, day: str, updates, horizon_minutes: int, expected_version: int | None = None
+) -> tuple[int, int]:
+    """补录/更正/撤销一批实发（actual 为 None 即撤销），返回 (条数, 当前版号)。
 
+    换版后批次必须带当前计划版号（expected_version）；旧版或缺失一律拒绝。
     逐条校验 -> 写入 -> 全日可行性校验，任一步失败整体回滚，保留原实发。
     """
     seen: set[str] = set()
@@ -156,6 +187,26 @@ def apply_actuals(conn, day: str, updates, horizon_minutes: int) -> int:
         seen.add(u.trip_id)
 
     with write_txn(conn):
+        row = conn.execute("SELECT version FROM days WHERE day = ?", (day,)).fetchone()
+        if row is None:
+            raise DayNotFound(day)
+        current = row["version"]
+        if expected_version is None:
+            if current > 1:
+                raise VersionConflict(
+                    "该运营日已换版，批次必须带计划版号 version",
+                    {"day": day, "current_version": current},
+                )
+        elif expected_version != current:
+            raise VersionConflict(
+                "批次计划版号已过期，未写入任何更改",
+                {
+                    "day": day,
+                    "submitted_version": expected_version,
+                    "current_version": current,
+                },
+            )
+
         planned: dict[str, int] = {}
         for u in updates:
             row = conn.execute(
@@ -186,7 +237,198 @@ def apply_actuals(conn, day: str, updates, horizon_minutes: int) -> int:
         total, conflicts = check_feasibility(conn, day, horizon_minutes)
         if total:
             raise BatchConflict(conflicts, total)
-    return len(updates)
+    return len(updates), current
+
+
+def replan(
+    conn,
+    day: str,
+    expected_version: int,
+    trips,
+    connections,
+    mapping,
+    horizon_minutes: int,
+) -> dict:
+    """重发某日全量计划，并把已提交实发按新旧班号对照一对一迁移。
+
+    - expected_version 必须是库中当前版号，否则拒绝（旧版/过期均不改动数据）。
+    - mapping（new -> old）必须覆盖当日所有已有实发的旧班次，且一对一；
+      迁移后每个新班次至多一份实发。
+    - 换版验算在写锁之外用读快照进行，期间补录/更正/撤销仍可提交；真正切换时
+      在写锁内重读并核对实发快照，实发若有变化则按最新实发重新验算
+      （切换始终按当时最新已提交的实发迁移）。验算沿用原计划/实发校验规则。
+    - 任一失败整体回滚，已提交的计划与实发原样保留。
+    """
+    edges, order = _validate_plan(trips, connections, horizon_minutes)
+
+    new_by_id = {t.trip_id for t in trips}
+    mapped_new = [m.new_trip_id for m in mapping]
+    mapped_old = [m.old_trip_id for m in mapping]
+    if len(set(mapped_new)) != len(mapped_new):
+        raise PlanError("对照中新班号重复", {"mapping": "new_trip_id 重复"})
+    if len(set(mapped_old)) != len(mapped_old):
+        raise PlanError("对照中旧班号重复", {"mapping": "old_trip_id 重复"})
+    for m in mapping:
+        if m.new_trip_id not in new_by_id:
+            raise PlanError(
+                "对照引用了新计划中不存在的班次",
+                {"new_trip_id": m.new_trip_id},
+            )
+    new_to_old = {m.new_trip_id: m.old_trip_id for m in mapping}
+
+    def migrate(old_actuals: dict[str, int], old_ids: set[str]) -> dict[str, int | None]:
+        """按对照把旧实发搬到新班号；旧班号或旧实发无去向则拒绝。"""
+        unknown = sorted(o for o in mapped_old if o not in old_ids)
+        if unknown:
+            raise PlanError(
+                "对照引用了旧计划中不存在的班次",
+                {"old_trip_id": unknown[0], "unknown_old_trip_ids": unknown},
+            )
+        missing = sorted(t for t in old_actuals if t not in set(mapped_old))
+        if missing:
+            raise PlanError(
+                "已有实发无法在新计划中找到去向（对照未覆盖）",
+                {
+                    "trip_id": missing[0],
+                    "missing_old_trip_ids": missing,
+                    "total_missing": len(missing),
+                },
+                status=409,
+            )
+        return {
+            t.trip_id: old_actuals.get(new_to_old.get(t.trip_id)) for t in trips
+        }
+
+    def verify(
+        old_actuals: dict[str, int], old_ids: set[str]
+    ) -> dict[str, int | None]:
+        new_actuals = migrate(old_actuals, old_ids)
+        # 迁入实发沿用原批录规则：不越界、不早于新版计划。
+        for t in trips:
+            actual = new_actuals.get(t.trip_id)
+            if actual is None:
+                continue
+            if not 0 <= actual < horizon_minutes:
+                raise PlanError(
+                    "迁入实发分钟超出运营日范围",
+                    {
+                        "trip_id": t.trip_id,
+                        "actual": actual,
+                        "horizon": horizon_minutes,
+                    },
+                    status=409,
+                )
+            if actual < t.planned:
+                raise PlanError(
+                    "迁入实发早于新版计划，未写入任何更改",
+                    {
+                        "trip_id": t.trip_id,
+                        "planned": t.planned,
+                        "actual": actual,
+                    },
+                    status=409,
+                )
+        trips_map, preds, succs = _state(trips, edges, order, new_actuals)
+        total, conflicts = feasibility(trips_map, preds, succs, horizon_minutes)
+        if total:
+            raise PlanError(
+                "新计划与迁入实发不满足原校验规则，未写入任何更改",
+                {"total_conflicts": total, "conflicts": conflicts},
+                status=409,
+            )
+        return new_actuals
+
+    def read_version_and_actuals(c):
+        row = c.execute("SELECT version FROM days WHERE day = ?", (day,)).fetchone()
+        if row is None:
+            raise DayNotFound(day)
+        old_ids = {
+            r["trip_id"]
+            for r in c.execute("SELECT trip_id FROM trips WHERE day = ?", (day,))
+        }
+        actuals = {
+            r["trip_id"]: r["actual"]
+            for r in c.execute(
+                "SELECT trip_id, actual FROM trips WHERE day = ? AND actual IS NOT NULL",
+                (day,),
+            )
+        }
+        return row["version"], old_ids, actuals
+
+    def check_version(current: int) -> None:
+        if expected_version != current:
+            raise VersionConflict(
+                "计划版号已过期，未写入任何更改",
+                {
+                    "day": day,
+                    "submitted_version": expected_version,
+                    "current_version": current,
+                },
+            )
+
+    # 第一段：写锁之外验算（补录/更正/撤销仍可提交）。
+    with read_txn(conn):
+        current, old_ids, snapshot = read_version_and_actuals(conn)
+        check_version(current)
+        new_actuals = verify(dict(snapshot), old_ids)
+
+    # 第二段：写锁内切换；若验算期间实发有变化，按最新已提交实发重新验算再切换。
+    with write_txn(conn):
+        version_now, current_ids, latest = read_version_and_actuals(conn)
+        check_version(version_now)
+        if latest != snapshot or current_ids != old_ids:
+            new_actuals = verify(latest, current_ids)
+        conn.execute("DELETE FROM connections WHERE day = ?", (day,))
+        conn.execute("DELETE FROM trips WHERE day = ?", (day,))
+        conn.executemany(
+            "INSERT INTO trips(day, trip_id, planned, topo, actual)"
+            " VALUES (?,?,?,?,?)",
+            [
+                (day, t.trip_id, t.planned, order[t.trip_id],
+                 new_actuals.get(t.trip_id))
+                for t in trips
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO connections(day, pred, succ, min_interval)"
+            " VALUES (?,?,?,?)",
+            [(day, p, s, m) for (p, s, m) in edges],
+        )
+        conn.execute(
+            "UPDATE days SET version = ? WHERE day = ?", (version_now + 1, day)
+        )
+
+    return {
+        "version": version_now + 1,
+        "previous_version": version_now,
+        "trips": len(trips),
+        "connections": len(edges),
+        "migrated": sum(1 for a in new_actuals.values() if a is not None),
+        "mapped_old_trip_ids": sorted(new_to_old.values()),
+        "mapping": [
+            {"new_trip_id": m.new_trip_id, "old_trip_id": m.old_trip_id}
+            for m in mapping
+        ],
+    }
+
+
+def _state(trips, edges, order, new_actuals):
+    """把新计划 + 迁入实发组装成可行性校验所需的内存结构。"""
+    trips_map = {
+        t.trip_id: {
+            "trip_id": t.trip_id,
+            "planned": t.planned,
+            "actual": new_actuals.get(t.trip_id),
+            "topo": order[t.trip_id],
+        }
+        for t in trips
+    }
+    preds: dict[str, list[tuple[str, int]]] = {}
+    succs: dict[str, list[tuple[str, int]]] = {}
+    for p, s, m in edges:
+        preds.setdefault(s, []).append((p, m))
+        succs.setdefault(p, []).append((s, m))
+    return trips_map, preds, succs
 
 
 def check_feasibility(conn, day: str, horizon_minutes: int) -> tuple[int, list[dict]]:
@@ -200,7 +442,12 @@ def check_feasibility(conn, day: str, horizon_minutes: int) -> tuple[int, list[d
     for r in conn.execute(
         "SELECT trip_id, planned, actual, topo FROM trips WHERE day = ?", (day,)
     ):
-        trips[r["trip_id"]] = r
+        trips[r["trip_id"]] = {
+            "trip_id": r["trip_id"],
+            "planned": r["planned"],
+            "actual": r["actual"],
+            "topo": r["topo"],
+        }
     preds: dict[str, list[tuple[str, int]]] = {}
     succs: dict[str, list[tuple[str, int]]] = {}
     for r in conn.execute(
@@ -208,6 +455,11 @@ def check_feasibility(conn, day: str, horizon_minutes: int) -> tuple[int, list[d
     ):
         preds.setdefault(r["succ"], []).append((r["pred"], r["min_interval"]))
         succs.setdefault(r["pred"], []).append((r["succ"], r["min_interval"]))
+    return feasibility(trips, preds, succs, horizon_minutes)
+
+
+def feasibility(trips, preds, succs, horizon_minutes) -> tuple[int, list[dict]]:
+    """纯内存的 EF/LF 可行性校验（换版验算与库内校验共用同一规则）。"""
     ordered = sorted(trips.values(), key=lambda row: row["topo"])
 
     ef: dict[str, int] = {}
@@ -310,6 +562,13 @@ class DayGraph:
                 (self.day, trip_id),
             ).fetchone()
         return self._trips[trip_id]
+
+    def version(self) -> int | None:
+        """当前计划版号；运营日不存在时为 None。"""
+        row = self.conn.execute(
+            "SELECT version FROM days WHERE day = ?", (self.day,)
+        ).fetchone()
+        return None if row is None else row["version"]
 
     def predecessors(self, trip_id: str) -> list[tuple[str, int]]:
         if trip_id not in self._preds:
